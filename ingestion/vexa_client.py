@@ -22,8 +22,7 @@ class VexaClient:
     Fetches real-time transcript data from active meetings.
     """
     
-    # TODO: Update with actual Vexa API base URL
-    DEFAULT_BASE_URL = "https://api.vexa.ai/v1"
+    DEFAULT_BASE_URL = "https://api.cloud.vexa.ai"
     
     def __init__(
         self,
@@ -42,13 +41,67 @@ class VexaClient:
         self.api_key = api_key
         self.base_url = (base_url or self.DEFAULT_BASE_URL).rstrip("/")
         self.timeout = timeout
+        self._bot_id: Optional[str] = None
         self._session = requests.Session()
         self._session.headers.update({
-            "Authorization": f"Bearer {api_key}",
+            "X-API-Key": api_key,
             "Content-Type": "application/json",
-            # TODO: Confirm header format with Vexa API docs
         })
         logger.info(f"VexaClient initialized, base_url={self.base_url}")
+    
+    def deploy_bot(
+        self,
+        native_meeting_id: str,
+        platform: str = "google_meet",
+        bot_name: str = "WhisperAssistant",
+    ) -> str:
+        """
+        Deploy a bot to join a meeting.
+        
+        Args:
+            native_meeting_id: The platform-specific meeting ID (e.g., "abc-defg-hij")
+            platform: Meeting platform ("google_meet", "zoom", "teams", etc.)
+            bot_name: Display name for the bot in the meeting
+        
+        Returns:
+            The bot ID for subsequent transcript fetches
+        
+        Raises:
+            VexaAPIError: On API errors
+        """
+        endpoint = f"{self.base_url}/bots"
+        payload = {
+            "platform": platform,
+            "native_meeting_id": native_meeting_id,
+            "bot_name": bot_name,
+        }
+        
+        try:
+            response = self._session.post(
+                endpoint,
+                json=payload,
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to deploy bot: {e}")
+            raise VexaAPIError(f"Failed to deploy bot: {e}") from e
+        
+        data = response.json()
+        # TODO: Confirm response structure - assuming {"bot_id": "..."}
+        self._bot_id = data.get("bot_id") or data.get("id")
+        logger.info(f"Bot deployed successfully, bot_id={self._bot_id}")
+        return self._bot_id
+    
+    @property
+    def bot_id(self) -> Optional[str]:
+        """Get the current bot ID."""
+        return self._bot_id
+    
+    @bot_id.setter
+    def bot_id(self, value: str):
+        """Set the bot ID (for resuming a session)."""
+        self._bot_id = value
     
     def fetch_latest_transcript(
         self,
@@ -59,7 +112,8 @@ class VexaClient:
         Fetch transcript segments from a meeting.
         
         Args:
-            meeting_id: The Vexa meeting ID to fetch transcripts for
+            meeting_id: The bot ID or meeting ID to fetch transcripts for.
+                        If bot was deployed via deploy_bot(), uses the stored bot_id.
             since_ts: Only return segments newer than this timestamp (epoch seconds).
                       If None, returns all available segments.
         
@@ -69,8 +123,10 @@ class VexaClient:
         Raises:
             VexaAPIError: On API errors
         """
-        # TODO: Confirm actual Vexa API endpoint path
-        endpoint = f"{self.base_url}/meetings/{meeting_id}/transcript"
+        # Use stored bot_id if available, otherwise use provided meeting_id
+        bot_id = self._bot_id or meeting_id
+        # TODO: Confirm actual Vexa API endpoint path for transcripts
+        endpoint = f"{self.base_url}/bots/{bot_id}/transcript"
         
         params = {}
         # TODO: Check if Vexa API supports server-side filtering by timestamp
@@ -90,6 +146,7 @@ class VexaClient:
             raise VexaAPIError(f"Failed to fetch transcript: {e}") from e
         
         raw_data = response.json()
+        print(f"Raw Vexa API response: {raw_data}")  # Debug log to inspect response structure
         utterances = self._normalize_response(raw_data, meeting_id)
         
         # Client-side filtering if API doesn't support since_ts
@@ -146,21 +203,38 @@ class VexaClient:
         
         return utterances
     
-    def check_meeting_active(self, meeting_id: str) -> bool:
+    def get_bot_status(self, bot_id: Optional[str] = None) -> dict:
         """
-        Check if a meeting is currently active.
+        Get the status of a deployed bot.
         
-        TODO: Implement based on actual Vexa API capabilities.
+        Args:
+            bot_id: The bot ID to check. If None, uses stored bot_id.
+        
+        Returns:
+            Bot status information dict
         """
-        # TODO: Implement actual meeting status check
-        # For now, assume meeting is always active if we can reach the API
+        bot_id = bot_id or self._bot_id
+        if not bot_id:
+            raise VexaAPIError("No bot_id available. Deploy a bot first.")
+        
         try:
-            endpoint = f"{self.base_url}/meetings/{meeting_id}/status"
+            endpoint = f"{self.base_url}/bots/{bot_id}"
             response = self._session.get(endpoint, timeout=self.timeout)
             response.raise_for_status()
-            data = response.json()
-            return data.get("status") == "active"
-        except requests.exceptions.RequestException:
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to get bot status: {e}")
+            raise VexaAPIError(f"Failed to get bot status: {e}") from e
+    
+    def check_meeting_active(self, meeting_id: str) -> bool:
+        """
+        Check if a meeting/bot session is currently active.
+        """
+        try:
+            status = self.get_bot_status(meeting_id)
+            # TODO: Confirm status field name from API response
+            return status.get("status") in ("active", "joined", "recording")
+        except VexaAPIError:
             # If we can't check, assume it's active and let fetch handle errors
             return True
     
